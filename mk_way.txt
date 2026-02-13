@@ -1,0 +1,23 @@
+BUSI:
+python train_mk.py --arch MK_UNet --dataset busi --input_w 256 --input_h 256 --name busi_UKAN  --data_dir ./inputs
+python val.py --name busi_UKAN --output_dir ./outputs/
+
+CVC:
+python train_mk.py --arch MK_UNet --dataset cvc --input_w 256 --input_h 256 --name cvc_UKAN  --data_dir ./inputs
+python val.py --name cvc_UKAN --output_dir ./outputs/
+
+GLAS:
+python train_mk.py --arch MK_UNet --batch_size 4 --dataset glas --input_w 512 --input_h 512 --name glas_UKAN  --data_dir ./inputs
+python val.py --name glas_UKAN --output_dir ./outputs/
+
+OCT:
+python train_mk.py --arch MK_UNet --dataset oct --input_w 256 --input_h 256 --name oct_UKAN  --data_dir ./inputs
+python val.py --name oct_UKAN --output_dir ./outputs/
+
+ISIC18:
+python train_mk.py --arch MK_UNet --dataset isic18 --input_w 256 --input_h 256 --name isic18_UKAN  --data_dir ./inputs
+python val.py --name isic18_UKAN --output_dir ./outputs/
+
+fives:
+python train_mk.py --arch MK_UNet --dataset fives --input_w 256 --input_h 256 --name fives_UKAN  --data_dir ./inputs
+python val.py --name fives_UKAN --output_dir ./outputs/
