@@ -287,6 +287,12 @@ def train(config, train_loader, model, criterion, optimizer):
     for input, target, _ in train_loader:
         input = input.cuda()
         target = target.cuda()
+        
+        # Prepare target for Multiclass
+        if config['num_classes'] > 1:
+            target = target.long()
+            if target.dim() == 4:
+                target = target.squeeze(1)
 
         # compute output
         if config['deep_supervision']:
@@ -346,6 +352,12 @@ def validate(config, val_loader, model, criterion):
         for step, (input, target, _) in enumerate(val_loader):
             input = input.cuda()
             target = target.cuda()
+            
+            # Prepare target for Multiclass
+            if config['num_classes'] > 1:
+                target = target.long()
+                if target.dim() == 4:
+                    target = target.squeeze(1)
 
             # compute output
             if config['deep_supervision']:
@@ -429,7 +441,10 @@ def main():
         yaml.dump(config, f)
 
     # define loss function (criterion)
-    if config['loss'] == 'BCEWithLogitsLoss':
+    if config['num_classes'] > 1:
+        print("=> Using CrossEntropyLoss for Multi-class Segmentation")
+        criterion = nn.CrossEntropyLoss().cuda()
+    elif config['loss'] == 'BCEWithLogitsLoss':
         criterion = nn.BCEWithLogitsLoss().cuda()
     else:
         criterion = losses.__dict__[config['loss']]().cuda()
@@ -486,7 +501,10 @@ def main():
     shutil.copy2('archs_mk.py', f'{output_dir}/{exp_name}/')
 
     dataset_name = config['dataset']
+    mask_folder = 'masks'
     if dataset_name == 'isic18':
+        img_ext = '.jpg'
+    elif dataset_name == 'REFUGE':
         img_ext = '.jpg'
     else:
         img_ext = '.png'
@@ -504,6 +522,10 @@ def main():
         mask_ext = '.png'
     elif dataset_name == 'isic18':
         mask_ext = '_segmentation.png'
+    elif dataset_name == 'REFUGE':
+        mask_ext = '.png'
+        mask_folder = 'labels'
+    
     # Data loading code
     img_ids = sorted(glob(os.path.join(config['data_dir'], config['dataset'], 'images', '*' + img_ext)))
     img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
@@ -515,20 +537,20 @@ def main():
         # geometric.transforms.Flip(),
         A.Flip(),
         Resize(config['input_h'], config['input_w']),
-        A.Normalize(),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         # transforms.Normalize(),
     ])
 
     val_transform = Compose([
         Resize(config['input_h'], config['input_w']),
         # transforms.Normalize(),
-        A.Normalize(),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
 
     train_dataset = Dataset(
         img_ids=train_img_ids,
         img_dir=os.path.join(config['data_dir'], config['dataset'], 'images'),
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),
+        mask_dir=os.path.join(config['data_dir'], config['dataset'], mask_folder),
         img_ext=img_ext,
         mask_ext=mask_ext,
         num_classes=config['num_classes'],
@@ -536,7 +558,7 @@ def main():
     val_dataset = Dataset(
         img_ids=val_img_ids,
         img_dir=os.path.join(config['data_dir'] ,config['dataset'], 'images'),
-        mask_dir=os.path.join(config['data_dir'], config['dataset'], 'masks'),
+        mask_dir=os.path.join(config['data_dir'], config['dataset'], mask_folder),
         img_ext=img_ext,
         mask_ext=mask_ext,
         num_classes=config['num_classes'],

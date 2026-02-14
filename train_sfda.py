@@ -8,6 +8,7 @@ import yaml
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
 from tqdm import tqdm
@@ -57,19 +58,19 @@ def parse_args():
     parser.add_argument('--arch', default='MK_UNet', help='model architecture')
     parser.add_argument('--deep_supervision', default=False, type=str2bool)
     parser.add_argument('--input_channels', default=3, type=int)
-    parser.add_argument('--num_classes', default=1, type=int)
+    parser.add_argument('--num_classes', default=3, type=int, help='Default 3 for Background/OD/OC')
     parser.add_argument('--input_list', default='128,160,256', type=str)
     parser.add_argument('--no_kan', action='store_true')
     
     # SFDA args
     parser.add_argument('--pretrained_ckpt', default=None, help='path to source pretrained model')
-    parser.add_argument('--lr_filter', default=1e-4, type=float)
-    parser.add_argument('--lr_student', default=1e-4, type=float)
+    parser.add_argument('--lr_filter', default=1e-5, type=float)
+    parser.add_argument('--lr_student', default=1e-5, type=float)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     
     parser.add_argument('--alpha_0', default=1.0, type=float, help='weight for seg loss in filter opt')
     parser.add_argument('--alpha_1', default=0.1, type=float, help='weight for mi loss in filter opt')
-    parser.add_argument('--alpha_2', default=0.1, type=float, help='weight for llh loss in student opt')
+    parser.add_argument('--alpha_2', default=0.01, type=float, help='weight for llh loss in student opt')
     parser.add_argument('--alpha_3', default=1.0, type=float, help='weight for con loss in student opt')
     
     parser.add_argument('--label_threshold', default=0.95, type=float, help='Threshold for pseudo-labels (higher helps HD95)')
@@ -77,6 +78,10 @@ def parse_args():
     parser.add_argument('--ema_alpha', default=0.9995, type=float)
     parser.add_argument('--output_dir', default='outputs', help='output dir')
     parser.add_argument('--num_workers', default=4, type=int)
+
+    # ROI Crop args for Optic Disc segmentation
+    parser.add_argument('--roi_crop', action='store_true', help='Enable intelligent ROI cropping for Optic Disc')
+    parser.add_argument('--roi_size', default=512, type=int, help='Size of the ROI crop')
 
     args = parser.parse_args()
     return args
@@ -91,19 +96,29 @@ def train_sfda(config_dict, train_loader, model, optimizer_filter, optimizer_stu
         'loss_llh': AverageMeter()
     }
 
-    # Optimization Strategy 3: Dynamic Loss Weights
-    # Determine weights based on epoch
-    # Warmup phase (first 20 epochs): Suppress auxiliary losses to stable training
-    if epoch < 20:
-        alpha_1 = config_dict['alpha_1'] * 0.01  # MI Loss -> 1%
-        alpha_2 = config_dict['alpha_2'] * 0.01  # LLH Loss -> 1%
-        alpha_3 = config_dict['alpha_3'] * 0.01  # Cons Loss -> 1%
+    # Optimization Strategy: Dynamic Loss Weights for Frequency Protection
+    # AIF Low-Frequency Protection Scheduling
+    # Goal: Allow filter to modify low-mid frequencies gently to remove color casts
+    if epoch < 10:
+        # Phase 1 (Epoch 0-9): Pure structural adaptation.
+        # Disable MI loss to allow filter to learn anything (though mostly constrained by seg loss)
+        # or keep it very low. Instructions say "set to 0".
+        alpha_1 = 0.0
+        
+        # Keep other losses stable
+        alpha_2 = config_dict['alpha_2'] * 1.0
+        alpha_3 = config_dict['alpha_3'] * 1.0
     else:
-        # Gradually introduce auxiliary losses
-        factor = min(1.0, 0.01 + (epoch - 20) * 0.05)
-        alpha_1 = config_dict['alpha_1'] * factor
-        alpha_2 = config_dict['alpha_2'] * factor
-        alpha_3 = config_dict['alpha_3'] * factor
+        # Phase 2 (Epoch 10+): Gently increase MI penalty to protect essential content 
+        # while stripping style. Target is around 0.05.
+        # Ramp up from 0.0 to 0.05 over e.g. 20 epochs
+        target_alpha_1 = 0.05
+        ramp_epochs = 20
+        progress = min(1.0, (epoch - 10) / ramp_epochs)
+        alpha_1 = target_alpha_1 * progress
+        
+        alpha_2 = config_dict['alpha_2'] * 1.0
+        alpha_3 = config_dict['alpha_3'] * 1.0
 
     model.train()
     pbar = tqdm(total=len(train_loader))
@@ -122,11 +137,25 @@ def train_sfda(config_dict, train_loader, model, optimizer_filter, optimizer_stu
             outputs = model(input, update_teacher=False)
             losses = model.compute_losses(outputs, input)
             loss_filter = config_dict['alpha_0'] * losses['loss_seg'] + alpha_1 * losses['mi_est']
-        
-        scaler.scale(loss_filter).backward()
-        scaler.step(optimizer_filter)
-        scaler.update()
-        
+
+        # 检查是否为隔离测试（滤波器被强行绕过）
+        is_isolation = False
+        if hasattr(model, 'is_isolation_test'):
+            is_isolation = model.is_isolation_test
+        # 兼容常规隔离写法：image_filtered==image_input
+        if hasattr(model, 'image_filtered') and hasattr(model, 'image_input'):
+            try:
+                if (model.image_filtered is model.image_input) or (model.image_filtered == model.image_input).all():
+                    is_isolation = True
+            except Exception:
+                pass
+
+        if not is_isolation:
+            scaler.scale(loss_filter).backward()
+            scaler.step(optimizer_filter)
+            scaler.update()
+        # 否则跳过filter优化器step，防止AMP报错
+
         avg_meters['loss_filter_total'].update(loss_filter.item(), input.size(0))
         avg_meters['loss_mi'].update(losses['mi_est'].item(), input.size(0))
 
@@ -274,6 +303,11 @@ def main():
         mask_ext = '.png'
         img_folder = 'images'
         mask_folder = 'masks'
+    elif dataset_name == 'Drishti-GS1':
+        img_ext = '.png'
+        mask_ext = '.png' # Handled by Dataset class logic
+        img_folder = 'images'
+        mask_folder = 'labels'
     elif dataset_name == 'isic2017':
         # Assuming Training set for Adaptation
         # Structure: isic2017/train/images, isic2017/train/masks 
@@ -315,12 +349,12 @@ def main():
     
     train_transform = Compose([
         Resize(args.input_h, args.input_w),
-        transforms.Normalize(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
     
     val_transform = Compose([
         Resize(args.input_h, args.input_w),
-        transforms.Normalize(),
+        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ])
     
     train_dataset = Dataset(
@@ -330,7 +364,10 @@ def main():
         img_ext=img_ext,
         mask_ext=mask_ext,
         num_classes=args.num_classes,
-        transform=train_transform
+        transform=train_transform,
+        roi_crop=args.roi_crop,
+        roi_size=args.roi_size,
+        dataset_name=dataset_name
     )
     
     val_dataset = Dataset(
@@ -340,7 +377,10 @@ def main():
         img_ext=img_ext,
         mask_ext=mask_ext,
         num_classes=args.num_classes,
-        transform=val_transform
+        transform=val_transform,
+        roi_crop=args.roi_crop,
+        roi_size=args.roi_size,
+        dataset_name=dataset_name
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -412,6 +452,68 @@ def main():
         # Regular save
         if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), os.path.join(save_dir, 'model_sfda_latest.pth'))
+
+            # --- Save visualization samples: input, filtered, pseudo_label (teacher), student segmentation
+            vis_dir = os.path.join(save_dir, f'vis_epoch_{epoch+1}')
+            os.makedirs(vis_dir, exist_ok=True)
+            saved = 0
+            with torch.no_grad():
+                for input_v, target_v, meta in val_loader:
+                    if saved >= 5:
+                        break
+                    input_v = input_v.cuda()
+                    outputs_v = model(input_v, update_teacher=False)
+                    # tensors: image_filtered, logits_teacher, logits_student
+                    img_in = input_v[0].cpu().numpy().transpose(1,2,0)
+                    img_f = outputs_v['image_filtered'][0].cpu().numpy().transpose(1,2,0)
+
+                    logits_t = outputs_v['logits_teacher'][0]
+                    probs_t = torch.sigmoid(logits_t) if logits_t.ndim==3 or logits_t.shape[0]==1 else F.softmax(logits_t.unsqueeze(0), dim=1).squeeze(0)
+                    # Make binary pseudo label (single-channel assumed)
+                    if isinstance(probs_t, torch.Tensor):
+                        if probs_t.ndim==3:
+                            pseudo = (probs_t > 0.5).cpu().numpy().astype('uint8')
+                            pseudo = pseudo.transpose(1,2,0)
+                        else:
+                            pseudo = (probs_t > 0.5).cpu().numpy().astype('uint8')
+                    else:
+                        pseudo = (probs_t > 0.5).astype('uint8')
+
+                    logits_s = outputs_v['logits_student'][0]
+                    probs_s = torch.sigmoid(logits_s) if logits_s.ndim==3 or logits_s.shape[0]==1 else F.softmax(logits_s.unsqueeze(0), dim=1).squeeze(0)
+                    if isinstance(probs_s, torch.Tensor):
+                        if probs_s.ndim==3:
+                            seg = (probs_s > 0.5).cpu().numpy().astype('uint8')
+                            seg = seg.transpose(1,2,0)
+                        else:
+                            seg = (probs_s > 0.5).cpu().numpy().astype('uint8')
+                    else:
+                        seg = (probs_s > 0.5).astype('uint8')
+
+                    import imageio
+                    # convert floats to uint8
+                    def to_uint8(x):
+                        x = x - x.min()
+                        if x.max() > 0:
+                            x = x / x.max()
+                        x = (x*255).astype('uint8')
+                        return x
+
+                    imageio.imsave(os.path.join(vis_dir, f'sample_{saved}_input.png'), to_uint8(img_in))
+                    imageio.imsave(os.path.join(vis_dir, f'sample_{saved}_filtered.png'), to_uint8(img_f))
+                    # pseudo and seg may be single-channel mask
+                    if pseudo.ndim==3 and pseudo.shape[2]==1:
+                        pseudo_img = (pseudo[:,:,0]*255).astype('uint8')
+                    else:
+                        pseudo_img = (pseudo*255).astype('uint8')
+                    if seg.ndim==3 and seg.shape[2]==1:
+                        seg_img = (seg[:,:,0]*255).astype('uint8')
+                    else:
+                        seg_img = (seg*255).astype('uint8')
+                    imageio.imsave(os.path.join(vis_dir, f'sample_{saved}_pseudo.png'), pseudo_img)
+                    imageio.imsave(os.path.join(vis_dir, f'sample_{saved}_seg.png'), seg_img)
+
+                    saved += 1
 
     print(f"Done. Best IoU: {best_iou}")
 
