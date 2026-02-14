@@ -30,6 +30,7 @@ def parse_args():
 
     parser.add_argument('--name', default=None, help='model name')
     parser.add_argument('--output_dir', default='outputs', help='ouput dir')
+    parser.add_argument('--dataset', default=None, help='dataset name')
             
     args = parser.parse_args()
 
@@ -57,6 +58,9 @@ def main():
     for key in config.keys():
         print('%s: %s' % (key, str(config[key])))
     print('-'*20)
+
+    if args.dataset is not None:
+        config['dataset'] = args.dataset
 
     cudnn.benchmark = True
 
